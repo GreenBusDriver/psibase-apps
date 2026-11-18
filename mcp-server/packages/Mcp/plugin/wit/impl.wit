@@ -1,0 +1,24 @@
+package mcp:plugin;
+
+world impl {
+    include host:client/imports;
+    include host:http/imports;
+    include host:accounts/imports;
+    // Top-level-app login/connect (not Host admin vault APIs).
+    import host:accounts/active-app;
+    include transact:plugin/imports;
+    include staged-tx:plugin/imports;
+    include auth-sig:plugin/imports;
+    import profiles:plugin/api;
+    import tokens:plugin/user-config;
+    import accounts:plugin/api;
+    include permissions:plugin/imports;
+
+    // mcp is the owner's auth service, so transact asks this plugin for the
+    // owner's claim/proof; it delegates to the owner's auth-sig key.
+    include transact:plugin/hook-user-auth;
+
+    export approvals;
+    export setup;
+    export agent-sign;
+}

@@ -1,0 +1,68 @@
+/// The staged-tx plugin handles responder-side actions on staged transactions
+/// (accept, reject, execute) and lets the proposer remove a staged transaction.
+///
+/// Proposing a staged transaction is done via the transact plugin's
+/// `set-propose-latch` and `propose` functions.
+package staged-tx:plugin;
+
+interface proposer {
+    use host:types/types.{error};
+
+    /// Removes (deletes) the specified staged transaction
+    ///
+    /// This is only callable by the proposer of the staged transaction
+    ///
+    /// Parameters:
+    /// * `id`: The ID of the database record containing the staged transaction
+    remove: func(id: u32) -> result<_, error>;
+}
+
+interface respondent {
+    use host:types/types.{error};
+
+    /// Accept the specified staged transaction
+    ///
+    /// Depending on the staging rules enforced by the auth service of the sender
+    /// of the staged transaction, this could result in the execution of the staged
+    /// transaction.
+    ///
+    /// Parameters:
+    /// * `id`: The ID of the database record containing the staged transaction
+    accept: func(id: u32) -> result<_, error>;
+
+    /// Reject the specified staged transaction
+    ///
+    /// Depending on the staging rules enforced by the auth service of the sender
+    /// of the staged transaction, this could result in the complete rejection and deletion of the
+    /// staged transaction.
+    ///
+    /// Parameters:
+    /// * `id`: The ID of the database record containing the staged transaction
+    reject: func(id: u32) -> result<_, error>;
+
+    /// Executes a transaction
+    ///
+    /// This is only needed when automatic execution is disabled
+    ///
+    /// * `id`: The ID of the database record containing the staged transaction
+    execute: func(id: u32) -> result<_, error>;
+}
+
+/// Interface that makes authorized queries to this app's http server.
+interface authorized {
+    use host:types/types.{error};
+
+    /// Executes a GraphQL query against this app's http server.
+    ///
+    /// Arguments
+    /// * `query` - GraphQL query to execute
+    ///
+    /// Returns the result of the query as a string.
+    graphql: func(query: string) -> result<string, error>;
+}
+
+world imports {
+    import proposer;
+    import respondent;
+    import authorized;
+}

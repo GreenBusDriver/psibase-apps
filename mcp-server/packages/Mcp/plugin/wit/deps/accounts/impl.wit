@@ -1,0 +1,14 @@
+package accounts:plugin;
+
+world impl {
+    include host:client/imports;
+    include host:http/imports;
+    include transact:plugin/imports;
+    include permissions:plugin/imports;
+    include host:accounts/imports;
+
+    import host:accounts/admin;
+
+    export api;
+    export admin;
+}

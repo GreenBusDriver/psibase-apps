@@ -1,0 +1,93 @@
+/// Owner side of X-MCP agents: list the agent transactions that need your
+/// approval, and approve them (optionally granting the agent the missing
+/// service/method pairs so a repeat auto-executes).
+/// Also: mint an agent account, make `mcp` the owner's auth service (owner
+/// keeps their key), and (for the agent signing page) propose actions with the
+/// owner as sender.
+package mcp:plugin;
+
+interface approvals {
+    use host:types/types.{error};
+
+    /// JSON array of `{ pending: { account, id, txid, proposer, actions }, missing: [string] }`
+    /// for staged txs whose sender is the logged-in owner.
+    /// Uses the logged-in user's query token, so only the owner can read it.
+    needs-approval: func() -> result<string, error>;
+
+    /// The logged-in owner `account` accepts staged tx `id`.
+    approve: func(account: string, id: u32) -> result<_, error>;
+    reject: func(account: string, id: u32) -> result<_, error>;
+    /// Logs in as the vault-held enforcer; restore-parent after the call signs.
+    enforce: func(owner: string, id: u32) -> result<_, error>;
+
+    /// In one transaction: grant every missing service/method pair of staged tx
+    /// `id` to the agent of `account`, save the edited standing rules, then accept.
+    approve-and-grant: func(account: string, id: u32, rules-json: string) -> result<_, error>;
+}
+
+interface setup {
+    use host:types/types.{error, pem};
+
+    /// Create a new AuthSig agent account (logged-in owner pays/signs).
+    /// Returns the new private key PEM; caller must save/confirm it.
+    create-agent-account: func(agent-name: string) -> result<pem, error>;
+
+    /// True if `private-key` authorizes `agent-name` (post-create ownership check).
+    confirm-agent-key: func(agent-name: string, private-key: pem) -> result<bool, error>;
+
+    /// In one owner-signed tx: register `agent-name` as the logged-in owner's
+    /// agent and distinct enforcer (`mcp::bootstrap`), then switch the owner's auth service to `mcp`
+    /// (`accounts::setAuthServ`). The owner's auth-sig key is unchanged, so
+    /// key login keeps working. No managed account is created.
+    /// Call `enable-agent-auto-debit` afterward (separate tx; agent must sign).
+    bootstrap: func(agent-name: string, enforcer-name: string) -> result<_, error>;
+
+    /// Verify an enforcer key matches `enforcer-name`, then require Host vault
+    /// import (plugin no longer mutates Host admin vault).
+    import-enforcer: func(enforcer-name: string, private-key: pem) -> result<_, error>;
+    /// Account currently logged in to mcp (read the owner before switching).
+    current-user: func() -> result<string, error>;
+
+    /// True if the logged-in owner has an auth-sig public key (needed to sign).
+    /// False for auth-any / insecure producer accounts that have no key.
+    has-signing-key: func() -> result<bool, error>;
+
+    /// Verify `agent-key`, log in as the agent (must already be in Host vault
+    /// and connected to mcp), and enable tokens auto-debit. Call
+    /// `restore-parent` afterward to restore the owner session.
+    enable-agent-auto-debit: func(agent-name: string, agent-key: pem) -> result<_, error>;
+
+    /// Log the owner back in to mcp after `enable-agent-auto-debit`.
+    restore-parent: func(parent: string) -> result<_, error>;
+
+    /// JSON `{ "agents": [AgentCfg...], "history": [HistEntry...] }` for the
+    /// logged-in owner (AgentCfg: account, agent, enforcer).
+    my-agents: func() -> result<string, error>;
+}
+
+interface agent-sign {
+    use host:types/types.{error, pem};
+
+    /// Verify agent key and log in as `account` (Host vault import first).
+    import-agent: func(account: string, private-key: pem) -> result<_, error>;
+
+    /// Propose actions whose sender is `owner` via ordinary `staged-tx::propose`
+    /// (`add_action_to_transaction`). `actions-json` is a JSON array of
+    /// `{ "service": string, "method": string, "rawData": "<hex>" }`.
+    /// Covered standing rules may auto-execute; otherwise call `track`
+    /// afterward (or use the parent approvals UI). Returns 0 (staged id not
+    /// surfaced by this path yet).
+    propose-as: func(owner: string, actions-json: string) -> result<u32, error>;
+
+    /// Convenience: propose `profiles.setProfile` with `owner` as sender.
+    propose-set-profile: func(owner: string, display-name: string, bio: string) -> result<_, error>;
+
+    /// Record staged tx `id` on the owner's needs-approval list.
+    track: func(id: u32) -> result<_, error>;
+}
+
+world imports {
+    import approvals;
+    import setup;
+    import agent-sign;
+}

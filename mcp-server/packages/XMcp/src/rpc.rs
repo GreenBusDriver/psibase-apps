@@ -1,0 +1,549 @@
+//! Transport-independent MCP JSON-RPC handling for X-MCP. Pure: chain access
+//! goes through [`ChainView`], so this is unit-tested natively.
+use crate::jsonschema::to_json_schema;
+use psibase::fracpack::{CompiledSchema, Pack};
+use psibase::{
+    schema_types, AccountNumber, Action, Hex, MethodNumber, MethodString, Schema, Tapos,
+    TimePointSec, Transaction,
+};
+use serde_json::{json, Value};
+
+pub const V2026: &str = "2026-07-28";
+pub const V2025: [&str; 4] = ["2025-03-26", "2025-06-18", "2025-11-25", "2024-11-05"];
+pub const LATEST_2025: &str = "2025-11-25";
+
+pub struct PackageInfo {
+    pub name: String,
+    pub description: String,
+    pub services: Vec<AccountNumber>,
+}
+
+/// Head-block TAPOS reference plus "now", as the live node sees it.
+pub struct HeadTapos {
+    pub ref_block_index: u8,
+    pub ref_block_suffix: u32,
+    /// Current time in seconds since the epoch.
+    pub now_seconds: i64,
+}
+
+/// How long a server-filled TAPOS stays valid: long enough to paste the
+/// result into the signing page and submit it. Only covers pushing this
+/// transaction; the owner's later approve is a separate transaction.
+pub const TAPOS_EXPIRATION_SECS: i64 = 120;
+
+pub trait ChainView {
+    fn packages(&self) -> Vec<PackageInfo>;
+    fn schema(&self, service: AccountNumber) -> Option<Schema>;
+    /// Same source as GET /common/tapos/head (Transact::headTapos) plus a clock.
+    fn head_tapos(&self) -> HeadTapos;
+}
+
+/// An HTTP-level request after transport parsing.
+pub struct Req<'a> {
+    pub method: &'a str,
+    pub origin: Option<&'a str>,
+    pub root_host: &'a str,
+    pub protocol_version: Option<&'a str>,
+    pub mcp_method: Option<&'a str>,
+    pub mcp_name: Option<&'a str>,
+    pub body: &'a [u8],
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Resp {
+    pub status: u16,
+    pub body: Option<Value>,
+    pub headers: Vec<(String, String)>,
+}
+
+fn resp(status: u16, body: Value) -> Resp {
+    Resp {
+        status,
+        body: Some(body),
+        headers: vec![],
+    }
+}
+
+fn rpc_err(id: &Value, code: i64, msg: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}})
+}
+
+/// Origin check. PoC: allow any Origin (cloud MCP / Grok Bot); use auth later.
+pub fn origin_ok(_origin: Option<&str>, _root_host: &str) -> bool {
+    true
+}
+
+pub fn handle(req: &Req, chain: &dyn ChainView) -> Resp {
+    match req.method {
+        "POST" => {}
+        "GET" => {
+            return Resp {
+                status: 405,
+                body: None,
+                headers: vec![("Allow".into(), "POST".into())],
+            }
+        }
+        _ => {
+            return Resp {
+                status: 405,
+                body: None,
+                headers: vec![("Allow".into(), "POST".into())],
+            }
+        }
+    }
+    if !origin_ok(req.origin, req.root_host) {
+        return resp(403, rpc_err(&Value::Null, -32600, "origin not allowed"));
+    }
+    let msg: Value = match serde_json::from_slice(req.body) {
+        Ok(v) => v,
+        Err(_) => return resp(400, rpc_err(&Value::Null, -32700, "parse error")),
+    };
+    let Some(method) = msg.get("method").and_then(Value::as_str) else {
+        // A response or garbage; we never send requests, so nothing to match.
+        return Resp {
+            status: 202,
+            body: None,
+            headers: vec![],
+        };
+    };
+    let id = msg.get("id").cloned();
+    let params = msg.get("params").cloned().unwrap_or(json!({}));
+
+    // Revision: header, else params._meta.protocolVersion, else 2025 (initialize).
+    let meta_ver = params
+        .pointer("/_meta/protocolVersion")
+        .and_then(Value::as_str);
+    let version = req.protocol_version.or(meta_ver);
+    if version == Some(V2026) {
+        if let (Some(h), Some(m)) = (req.protocol_version, meta_ver) {
+            if h != m {
+                return resp(
+                    400,
+                    rpc_err(
+                        id.as_ref().unwrap_or(&Value::Null),
+                        -32600,
+                        "MCP-Protocol-Version does not match _meta",
+                    ),
+                );
+            }
+        }
+        if req.mcp_method != Some(method) {
+            return resp(
+                400,
+                rpc_err(
+                    id.as_ref().unwrap_or(&Value::Null),
+                    -32600,
+                    "Mcp-Method header missing or does not match body",
+                ),
+            );
+        }
+        if matches!(method, "tools/call" | "resources/read" | "prompts/get") {
+            let name = params
+                .get("name")
+                .or(params.get("uri"))
+                .and_then(Value::as_str);
+            if req.mcp_name.is_none() || req.mcp_name != name {
+                return resp(
+                    400,
+                    rpc_err(
+                        id.as_ref().unwrap_or(&Value::Null),
+                        -32600,
+                        "Mcp-Name header missing or does not match body",
+                    ),
+                );
+            }
+        }
+    } else if let Some(v) = version {
+        if !V2025.contains(&v) {
+            return resp(
+                400,
+                rpc_err(
+                    id.as_ref().unwrap_or(&Value::Null),
+                    -32600,
+                    &format!("unsupported protocol version {v}"),
+                ),
+            );
+        }
+    }
+
+    let Some(id) = id else {
+        // Notification (e.g. notifications/initialized)
+        return Resp {
+            status: 202,
+            body: None,
+            headers: vec![],
+        };
+    };
+
+    let result = match method {
+        "initialize" => {
+            let asked = params
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .unwrap_or(LATEST_2025);
+            let v = if V2025.contains(&asked) {
+                asked
+            } else {
+                LATEST_2025
+            };
+            let mut r = resp(
+                200,
+                ok(
+                    &id,
+                    json!({
+                        "protocolVersion": v,
+                        "capabilities": {"tools": {"listChanged": false}},
+                        "serverInfo": server_info(),
+                        "instructions": instructions(req.root_host),
+                    }),
+                ),
+            );
+            // Thin 2025 compatibility shim: stateless, so the id carries no state.
+            r.headers
+                .push(("Mcp-Session-Id".into(), "x-mcp-stateless".into()));
+            return r;
+        }
+        "server/discover" => Ok(json!({
+            "supportedVersions": [V2026, "2025-11-25", "2025-06-18", "2025-03-26"],
+            "capabilities": {"tools": {}},
+            "serverInfo": server_info(),
+            "instructions": instructions(req.root_host),
+        })),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({ "tools": meta_tools(req.root_host) })),
+        "tools/call" => {
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+            let args = params.get("arguments").cloned().unwrap_or(json!({}));
+            Ok(match call_tool(name, &args, chain, req.root_host) {
+                Ok(v) => json!({
+                    "content": [{"type": "text", "text": v.to_string()}],
+                    "structuredContent": v,
+                    "isError": false
+                }),
+                Err(e) => json!({"content": [{"type": "text", "text": e}], "isError": true}),
+            })
+        }
+        _ => Err((-32601, format!("method not found: {method}"))),
+    };
+    match result {
+        Ok(v) => resp(200, ok(&id, v)),
+        Err((c, m)) => resp(200, rpc_err(&id, c, &m)),
+    }
+}
+
+fn ok(id: &Value, result: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+fn server_info() -> Value {
+    json!({"name": "x-mcp", "title": "X-MCP (psibase)", "version": env!("CARGO_PKG_VERSION")})
+}
+
+fn instructions(root_host: &str) -> String {
+    format!(
+        "X-MCP describes on-chain psibase services and builds unsigned transactions. \
+It never signs or pushes.
+
+Node: {root_host}, over the same scheme and port you used to reach this server. \
+\"The node\" below means this URL; other hosts below use the same scheme and port. \
+Each service answers on its own subdomain (tokens.{root_host}, staged-tx.{root_host}, \
+mcp.{root_host}); the bare node URL only redirects to the homepage.
+
+Build: list_services, then describe_service, then build_transaction. \
+Omit `tapos`: X-MCP fills it from the node's head block and sets expiration to about \
+2 minutes from now, so sign and submit promptly (rebuild if it expires). The result is for \
+review, and its `next` holds a prefilled link to the signing page below plus the steps to \
+submit and to check the outcome.
+
+Token amounts: a Quantity is a scaled integer, the human amount times 10^precision of \
+that token. Ten tokens at precision 4 is 100000, not 10. X-MCP packs whatever integer it \
+is given and never converts decimals. To find the system token, make two separate POSTs to \
+tokens.{root_host}/graphql:
+1. {{ config {{ sysTid }} }} returns the system token id.
+2. {{ token(tokenId: \"<that id>\") {{ precision id symbol }} }} (tokenId is a string) \
+returns its precision (0-8) and symbol.
+Then pass round(amount * 10^precision) as the Quantity, e.g. amount: {{ value: 100000 }} \
+or the bare integer, as describe_service's schema for tokens.credit and similar shows.
+
+Submit: only through the signing page mcp.{root_host}/agent.html (needs a browser with \
+JavaScript). Open it with ?agent=<your account>&owner=<account you act for>&actions=<url-encoded \
+build_transaction result>, paste your private key, click #btn-import then #btn-propose, \
+and read #result (JSON: executed, or stagedId and txid when the owner must approve). \
+Do not sign or push the transaction yourself. Full element contract: mcp.{root_host}/agent.txt. \
+To see what became of a staged transaction, POST to staged-tx.{root_host}/graphql: \
+{{ txidHistory(txid: \"<txid>\") {{ nodes {{ actor eventType datetime }} }} }}.
+
+Acting for the user's account (the owner): keep that account as each action's sender; you are \
+the proposer. The signing page's #btn-propose stages the transaction and calls mcp::track. \
+Allowlisted alone does not finish the tx when an enforcer is configured; the owner's Approvals \
+tab (mcp.{root_host}/) must stay open to run the enforcer. Unallowlisted methods wait for the \
+owner to approve there."
+    )
+}
+
+pub fn meta_tools(root_host: &str) -> Value {
+    let build = format!(
+        "Pack a list of actions into one unsigned transaction. TAPOS is filled by the server \
+(head block reference, expiration about 2 minutes from now) unless overridden. Token amounts \
+(Quantity) are scaled integers: human amount times 10^precision (10 tokens at precision 4 = \
+100000); X-MCP packs integers as given and never converts decimals. For the system token id \
+and its precision, make two POSTs to tokens.{root_host}/graphql (same scheme and port as this \
+endpoint): {{ config {{ sysTid }} }}, then {{ token(tokenId: \"<that id>\") {{ precision }} }}. \
+Returns agent-readable JSON (TAPOS + each action's sender, service, method, decoded data) and \
+the packed bytes (hex) of the same transaction. If `propose` is given, the actions are wrapped \
+in a staged-tx propose action sent by the proposer. Never signs or pushes: the result's `next` \
+gives a prefilled link to the signing page (mcp.{root_host}/agent.html, opened in a browser) \
+and the steps to submit there and check the outcome. Submit through that page; do not sign or \
+push the transaction with your own code."
+    );
+    json!([
+        {"name": "list_services", "description": "List installed packages and their service accounts.",
+         "inputSchema": {"type": "object", "properties": {}}, "annotations": {"readOnlyHint": true}},
+        {"name": "describe_service", "description": "List the transaction actions (tools) of one service account, each with a JSON Schema for its arguments.",
+         "inputSchema": {"type": "object", "properties": {"service": {"type": "string"}}, "required": ["service"]},
+         "annotations": {"readOnlyHint": true}},
+        {"name": "build_transaction",
+         "description": build,
+         "inputSchema": {"type": "object", "required": ["actions"], "properties": {
+            "actions": {"type": "array", "items": {"type": "object", "required": ["sender","service","method","data"],
+                "properties": {"sender": {"type":"string"}, "service": {"type":"string"}, "method": {"type":"string"}, "data": {"type":"object"}}}},
+            "tapos": {"type": "object", "description": "Optional; omit it and the server fills it. Override only for tests or unusual delays: {refBlockIndex, refBlockSuffix, expiration, flags}. If only the head reference is given, the server fills expiration."},
+            "propose": {"type": "object", "properties": {"proposer": {"type":"string"}, "autoExec": {"type":"boolean"}}, "required": ["proposer"]}
+         }},
+         "annotations": {"readOnlyHint": true}}
+    ])
+}
+
+fn acct(v: &Value, field: &str) -> Result<AccountNumber, String> {
+    let s = v
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or(format!("missing {field}"))?;
+    AccountNumber::from_exact(s).map_err(|e| format!("bad {field} '{s}': {e}"))
+}
+
+/// Methods that are HTTP/system handlers, not transaction tools.
+pub fn is_tool_method(name: &str) -> bool {
+    !(name.starts_with('#') || name == "serveSys" || name.ends_with("Sys"))
+}
+
+pub fn call_tool(
+    name: &str,
+    args: &Value,
+    chain: &dyn ChainView,
+    root_host: &str,
+) -> Result<Value, String> {
+    match name {
+        "list_services" => Ok(json!({"packages": chain.packages().iter().map(|p| json!({
+            "package": p.name, "description": p.description,
+            "services": p.services.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        })).collect::<Vec<_>>()})),
+        "describe_service" => {
+            let service = acct(args, "service")?;
+            let schema = chain
+                .schema(service)
+                .ok_or(format!("no schema for {service}"))?;
+            let tools: Vec<Value> = schema
+                .actions
+                .iter()
+                .filter(|(m, _)| is_tool_method(&m.0))
+                .map(|(m, f)| {
+                    json!({
+                        "name": format!("{service}.{}", m.0),
+                        "service": service.to_string(),
+                        "method": m.0,
+                        "kind": "action",
+                        "sideEffect": "write",
+                        "inputSchema": to_json_schema(&schema.types, &f.params, 0),
+                    })
+                })
+                .collect();
+            Ok(json!({"service": service.to_string(), "tools": tools}))
+        }
+        "build_transaction" => build_transaction(args, chain).map(|mut v| {
+            v["next"] = submit_next(root_host, &v);
+            v
+        }),
+        _ => Err(format!("unknown tool {name}")),
+    }
+}
+
+fn query_escape(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// What to do with a build_transaction result: a prefilled signing page link
+/// and the steps to submit there and read the outcome.
+fn submit_next(root_host: &str, built: &Value) -> Value {
+    let none = vec![];
+    let outer = built["transaction"]["actions"].as_array().unwrap_or(&none);
+    let (agent, inner) = match outer.as_slice() {
+        [a] if a["service"] == "staged-tx" && a["method"] == "propose" => (
+            a["sender"].as_str(),
+            a["data"]["actions"].as_array().unwrap_or(&none),
+        ),
+        _ => (None, outer),
+    };
+    let owner = inner
+        .first()
+        .and_then(|a| a["sender"].as_str())
+        .filter(|s| inner.iter().all(|a| a["sender"] == *s));
+    let actions: Vec<Value> = inner
+        .iter()
+        .map(|a| json!({"service": a["service"], "method": a["method"], "rawData": a["rawData"]}))
+        .collect();
+    let mut page = format!("mcp.{root_host}/agent.html?");
+    for (k, v) in [("agent", agent), ("owner", owner)] {
+        if let Some(v) = v {
+            page.push_str(&format!("{k}={}&", query_escape(v)));
+        }
+    }
+    page.push_str(&format!(
+        "actions={}",
+        query_escape(&Value::from(actions).to_string())
+    ));
+    json!({
+        "signingPage": page,
+        "steps": [
+            "Open signingPage in a browser with JavaScript, over the same scheme and port as this endpoint. Submit there; do not sign or push this transaction with your own code. If you have no browser here, hand signingPage to a context or person that does. If the link is too long, open it without actions= and paste this whole result into #actions-json.",
+            "Paste the agent account's private key into #agent-key, click #btn-import, and wait for #status to read \"Logged in as <agent>\". Signing happens in the page; nothing private is sent to the node.",
+            "Click #btn-propose, then read #result (JSON).",
+            "executed:true means it ran. executed:false means it is staged as stagedId, waiting for the owner's approval or enforcer; keep its txid.",
+            format!("To see what became of a staged transaction, POST to staged-tx.{root_host}/graphql: {{ txidHistory(txid: \"<txid>\") {{ nodes {{ actor eventType datetime }} }} }}. An \"executed\" event means it ran; \"rejected\", or \"deleted\" without \"executed\", means it will not run; otherwise it is still waiting."),
+        ],
+    })
+}
+
+fn pack_action(a: &Value, chain: &dyn ChainView) -> Result<(Action, Value), String> {
+    let sender = acct(a, "sender")?;
+    let service = acct(a, "service")?;
+    let method_s = a
+        .get("method")
+        .and_then(Value::as_str)
+        .ok_or("missing method")?;
+    let data = a.get("data").cloned().unwrap_or(json!({}));
+    let schema = chain
+        .schema(service)
+        .ok_or(format!("no schema for {service}"))?;
+    let f = schema
+        .actions
+        .get(&MethodString(method_s.to_string()))
+        .ok_or(format!("{service} has no action {method_s}"))?;
+    if !is_tool_method(method_s) {
+        return Err(format!("{service}.{method_s} is not a transaction action"));
+    }
+    let custom = schema_types();
+    let mut cs = CompiledSchema::new(&schema.types, &custom);
+    cs.extend(&f.params);
+    let raw = cs
+        .from_value(&f.params, &data)
+        .map_err(|e| format!("{service}.{method_s}: {e}"))?;
+    let decoded = cs.to_value(&f.params, &raw).map_err(|e| format!("{e:?}"))?;
+    let action = Action {
+        sender,
+        service,
+        method: MethodNumber::from(method_s),
+        rawData: Hex(raw),
+    };
+    let j = json!({
+        "sender": sender.to_string(), "service": service.to_string(), "method": method_s,
+        "data": decoded, "rawData": action.rawData.to_string()
+    });
+    Ok((action, j))
+}
+
+pub fn build_transaction(args: &Value, chain: &dyn ChainView) -> Result<Value, String> {
+    let list = args
+        .get("actions")
+        .and_then(Value::as_array)
+        .ok_or("actions must be an array")?;
+    if list.is_empty() {
+        return Err("actions is empty".into());
+    }
+    let mut actions = Vec::new();
+    let mut ajson = Vec::new();
+    for a in list {
+        let (act, j) = pack_action(a, chain)?;
+        actions.push(act);
+        ajson.push(j);
+    }
+    let mut notes: Vec<String> = Vec::new();
+    // TAPOS: the server fills whatever the caller left out from the node's
+    // head block and clock. A full caller-supplied tapos is an override.
+    let given = args.get("tapos").and_then(Value::as_object);
+    let has = |k: &str| given.map_or(false, |g| g.contains_key(k));
+    let need_ref = !(has("refBlockIndex") && has("refBlockSuffix"));
+    let need_exp = !has("expiration");
+    let mut t = json!({"flags": 0});
+    if need_ref || need_exp {
+        let head = chain.head_tapos();
+        if need_ref {
+            t["refBlockIndex"] = json!(head.ref_block_index);
+            t["refBlockSuffix"] = json!(head.ref_block_suffix);
+        }
+        if need_exp {
+            let exp = TimePointSec::from(head.now_seconds + TAPOS_EXPIRATION_SECS);
+            t["expiration"] = serde_json::to_value(exp).unwrap();
+        }
+    }
+    if let Some(g) = given {
+        for (k, v) in g {
+            t[k] = v.clone();
+        }
+    }
+    match (need_ref, need_exp) {
+        (true, true) => notes.push(format!(
+            "tapos filled by the server from the head block; expires in {TAPOS_EXPIRATION_SECS}s: sign and submit before then, or rebuild"
+        )),
+        (true, false) => notes.push("tapos head reference filled by the server; expiration as supplied".to_string()),
+        (false, true) => notes.push(format!(
+            "tapos.expiration filled by the server: {TAPOS_EXPIRATION_SECS}s from now"
+        )),
+        (false, false) => {}
+    }
+    let tapos: Tapos = serde_json::from_value(t).map_err(|e| format!("bad tapos: {e}"))?;
+    let (tx_actions, propose_json) = if let Some(p) = args.get("propose") {
+        let proposer = acct(p, "proposer")?;
+        let auto_exec = p.get("autoExec").and_then(Value::as_bool).unwrap_or(true);
+        let raw = (actions.clone(), auto_exec).packed();
+        let wrap = Action {
+            sender: proposer,
+            service: AccountNumber::from_exact("staged-tx").unwrap(),
+            method: MethodNumber::from("propose"),
+            rawData: Hex(raw),
+        };
+        let wj = json!({"sender": proposer.to_string(), "service": "staged-tx", "method": "propose",
+            "data": {"actions": ajson, "auto_exec": auto_exec}, "rawData": wrap.rawData.to_string()});
+        notes.push(String::from(
+            "submit through next.signingPage (#btn-propose tracks for Approvals/enforcer); do not sign or push yourself",
+        ));
+        (vec![wrap], Some(vec![wj]))
+    } else {
+        (actions, None)
+    };
+    let tx = Transaction {
+        tapos: tapos.clone(),
+        actions: tx_actions,
+        claims: vec![],
+    };
+    Ok(json!({
+        "transaction": {
+            "tapos": serde_json::to_value(&tapos).unwrap(),
+            "actions": propose_json.unwrap_or(ajson),
+            "claims": [],
+        },
+        "packed": Hex(tx.packed()).to_string(),
+        "notes": notes,
+    }))
+}
+
+#[cfg(test)]
+mod tests;

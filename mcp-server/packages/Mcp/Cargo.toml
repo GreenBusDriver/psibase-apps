@@ -1,0 +1,31 @@
+[package]
+name = "mcp-pkg"
+description = "Owner frontend for X-MCP agents: needs-approval UI, agent allowlist, and owner auth service"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[package.metadata.psibase]
+package-name = "Mcp"
+services = ["mcp"]
+
+[package.metadata.psibase.dependencies]
+Accounts = "0.29.0"
+AuthSig = "0.29.0"
+Host = "0.29.0"
+Permissions = "0.29.0"
+Profiles = "0.29.0"
+Tokens = "0.29.0"
+Transact = "0.29.0"
+HttpServer = "0.29.0"
+Sites = "0.29.0"
+StagedTx = "0.29.0"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+mcp = { path = "service", version = "0.29.0" }
+r-mcp = { path = "query-service", version = "0.29.0" }
+mcp-plugin = { path = "plugin", version = "0.29.0" }
