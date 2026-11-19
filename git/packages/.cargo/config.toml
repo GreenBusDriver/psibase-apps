@@ -1,0 +1,4 @@
+[target.wasm32-wasip1]
+# Host imports (kvGet, …) stay undefined until cargo-psibase polyfills.
+# rust-lld on Rust 1.98+ rejects them without this.
+rustflags = ["-C", "link-arg=--allow-undefined"]

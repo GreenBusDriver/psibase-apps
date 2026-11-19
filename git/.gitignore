@@ -1,0 +1,8 @@
+# Cargo target dirs (packages/ and helper/)
+target/
+
+**/*.rs.bk
+.psibase-devnet/
+.direnv/
+result
+result-*
